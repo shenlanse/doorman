@@ -19,6 +19,7 @@ import (
 	"github.com/youtube/doorman/go/client/doorman"
 	"math"
 	"sync"
+	"time"
 )
 
 // MUST be ware that when new capacity is smaller than old capacity,
@@ -53,6 +54,17 @@ func NewInFlightRateLimiter(res doorman.Resource) RateLimiter {
 
 // run is the rate limiter's main loop.
 func (flight *inFlightRateLimiter) run() {
+	// to wake up waiting clients periodically
+	go func() {
+		ticker:=time.NewTicker(time.Second)
+		for _ =range ticker.C{
+			select {
+			case flight.semaphore <- true:
+			default:
+			}
+		}
+	}()
+
 	for true {
 		if capacity, ok := <-flight.resource.Capacity(); ok {
 			flight.updateCapacity(capacity)
@@ -63,7 +75,8 @@ func (flight *inFlightRateLimiter) run() {
 	}
 }
 
-func (flight *inFlightRateLimiter) Ask(ctx context.Context) error {
+// // Wait blocks until a time appropriate operation to run or an error occurs.
+func (flight *inFlightRateLimiter) Wait(ctx context.Context) error {
 	var flag int
 	flight.Lock()
 	// have to lock this operation
@@ -75,7 +88,11 @@ func (flight *inFlightRateLimiter) Ask(ctx context.Context) error {
 
 		flight.Unlock()
 		// we have to release lock before this operation
-		<-flight.semaphore
+		select {
+		case <-ctx.Done():
+			break
+		case <-flight.semaphore:
+		}
 		flight.Lock()
 	}
 	flight.Unlock()
@@ -83,7 +100,10 @@ func (flight *inFlightRateLimiter) Ask(ctx context.Context) error {
 	flight.Lock()
 	defer flight.Unlock()
 
-	flight.inflights++
+	if ctx.Err() == nil {
+		flight.inflights++
+	}
+
 	if flag != 0 {
 		flight.waiting--
 	}
@@ -94,11 +114,12 @@ func (flight *inFlightRateLimiter) Ask(ctx context.Context) error {
 func (flight *inFlightRateLimiter) Return(ctx context.Context) error {
 	flight.Lock()
 	flight.inflights--
-
-	if flight.waiting != 0 {
-		flight.semaphore <- true
-	}
 	flight.Unlock()
+
+	select {
+	case flight.semaphore <- true:
+	default:
+	}
 
 	return nil
 }
@@ -114,7 +135,10 @@ func (flight *inFlightRateLimiter) updateCapacity(capacity int) {
 
 	if capacity > old && flight.waiting != 0 {
 		for fresh := int(math.Min(capacity-old, flight.waiting)); fresh != 0; fresh-- {
-			flight.semaphore <- true
+			select {
+			case flight.semaphore <- true:
+			default:
+			}
 		}
 	}
 	flight.Unlock()
